@@ -4,9 +4,74 @@ import pandas as pd
 from scipy.interpolate import interp1d
 
 
+"""
+================================================================================
+NÁZEV: 1D TERMOHYDRAULICKÝ MODEL MOKRÉ SPOJKY (FDM/MKP)
+VERZE: 2.1 (S Drag Torque & Laminárním/Turbulentním přepínáním)
+================================================================================
+
+POPIS MODELU:
+Tento skript slouží k detailní simulaci teplotního chování ocelové (separační) 
+lamely mokré spojky v čase. Na rozdíl od jednoduchých 0D modelů (které uvažují 
+lamelu jako jeden hmotný bod s rovnoměrnou teplotou) využívá tento model 
+numerickou metodu konečných diferencí (FDM) k výpočtu teplotního gradientu 
+napříč tloušťkou materiálu.
+
+HLAVNÍ ROZDÍLY OPROTI 0D MODELU:
+--------------------------------
+1. Rozložení teploty (Gradient):
+   - Model rozlišuje teplotu na POVRCHU (styková plocha s třecím obložením) 
+     a v JÁDŘE (střed materiálu).
+   - Dokáže odhalit krátkodobé teplotní špičky na povrchu ("Skin effect"), 
+     které 0D model zprůměruje a skryje.
+
+2. Pokročilá Hydrodynamika (Chlazení):
+   - Součinitel přestupu tepla 'h' není konstanta.
+   - Počítá se dynamicky v každém kroku na základě otáček, geometrie drážek 
+     a viskozity oleje.
+   - Režim 'ANALYTIC_REAL' automaticky přepíná mezi Laminárním a Turbulentním 
+     prouděním podle Reynoldsova čísla (Re).
+
+3. Vlečný moment (Drag Torque):
+   - Zohledňuje parazitní zahřívání v rozpojeném stavu (Pauza).
+   - Počítá viskózní tření oleje mezi lamelami (kritické pro DCT převodovky 
+     a opakované cykly, kde teplota neklesá k nule).
+
+FYZIKÁLNÍ PRINCIP VÝPOČTU:
+--------------------------
+1. ZDROJ TEPLA: 
+   Třecí výkon (Moment x Skluz) se poníží o koeficient Beta (dělení tepla 
+   mezi ocel a obložení). Do oceli vstupuje cca 90-95 % tepla, zbytek jde 
+   do izolantu (papíru).
+
+2. VEDENÍ TEPLA (Conduction): 
+   Řeší se 1D rovnice vedení tepla napříč tloušťkou oceli.
+
+3. ODVOD TEPLA (Convection): 
+   Povrch je ochlazován olejem. Intenzita chlazení je omezena buď fyzikou 
+   mezní vrstvy (Nusseltovo číslo), nebo celkovým průtokem oleje (Flow Limit).
+
+VSTUPY A PŘEDPOKLADY:
+---------------------
+- Materiál: Nelineární vlastnosti oceli (vodivost a kapacita se mění s teplotou).
+- Geometrie: Uvažuje se efektivní plocha po odečtení drážek (volitelné).
+- Okrajové podmínky: Adiabatická stěna ve středu lamely (symetrie), 
+  teplo uniká pouze do oleje (zanedbáno vedení do hřídele -> konzervativní).
+
+VÝSTUPY:
+--------
+- Časový průběh teploty povrchu a jádra.
+- Celková tepelná bilance a potřebný chladicí výkon.
+- Identifikace rizika spálení oleje (povrchová teplota) vs. přehřátí materiálu (objemová teplota).
+
+================================================================================
+"""
+
 # NASTAVENÍ MODELU
 # --------------------------------------------------------------------------------
+# řádek 312 - Parametry spojky
 
+# podávat na  250?
 # TYP OCHLAZOVÁNÍ SPOJKY
 # MOŽNOSTI:
 #   "ANALYTIC_REAL" = (NOVÉ) Dynamicky přepíná Laminární/Turbulentní tok dle otáček (Re).
@@ -14,11 +79,14 @@ from scipy.interpolate import interp1d
 #   "FLOW_LIMIT"    = Počítá maximální možné chlazení dle kapacity průtoku.
 #   "NO_COOLING"    = Vypne chlazení (h = 0).
 
-CHLAZENI_TYP = "ANALYTIC_REAL"   # <--- ZMĚNA MOŽNOSTI
+CHLAZENI_TYP = "ANALYTIC"   # <--- ZMĚNA MOŽNOSTI
+# řádek 209 - korekce teplotního součinitele h
+# řádek 248 - změna Nu pro laminární proudění
 
 # Započítání zmenšené plochy obložení, kterou odebírájí drážky (Waffle profil)
 # True = Větší tepelný tok do separační lamely (menší plocha obložení)
 # False = Ignoruje se (používá se celá plocha obložení)
+# řádek 292 - modifikace plochy drážek 
 INCLUDE_AREA_REDUCTION = False  
 
 # Výkon, který odebírá PTO
@@ -60,7 +128,7 @@ t_pauza = 30.0         # [s] Doba rozpojení spojky
 # CHLAZENÍ SPOJKY V DOBĚ ROZPOJENÍ
 # True = Povolit chlazení celé plochy v rozpojeném stavu
 # False = Vypnout chlazení celé plochy v rozpojeném stavu
-ENABLE_OPEN_CLUTCH_COOLING = True  # Povolit "Flow Limit" na celou plochu v pauze
+ENABLE_OPEN_CLUTCH_COOLING = False  # Povolit "Flow Limit" na celou plochu v pauze
 ratio_pause = 1.0                  # 100% plochy se chladí
 
 # Unašivý moment
@@ -213,11 +281,7 @@ def get_drag_torque_analytical(rpm_slip, T_viscosity_input, geometry, h_gap_mm):
     # Úhlová rychlost prokluzu [rad/s]
     omega_slip = rpm_slip * (2 * np.pi / 60)
     
-    # 4. Výpočet momentu
-    # Tento vzorec integruje smykové napětí tau = mu * (v/h) * r po ploše.
-    # Protože v = omega * r, je tau závislé na r.
-    # Výsledkem je závislost na čtvrté mocnině poloměru (velký vliv průměru!).
-    
+    # Výpočet momentu
     term_geo = (r_out**4 - r_in**4)
     M_drag = (np.pi * mu * omega_slip * term_geo) / (2 * h_gap)
     
@@ -237,11 +301,11 @@ def load_engine_map(filename='motor_data.xlsx'):
     except KeyError:
         print("CHYBA: Excel musí mít sloupce 'RPM' a 'Torque'.")
         raise
-    # Vytvoří "spojitou čáru" z bodů (interpolace)
+    # interpolace
     interp_func = interp1d(rpm_data, torque_data, kind='linear', fill_value="extrapolate")
     return interp_func, rpm_data, torque_data
 
-# INICIALIZACE A GEOMETRIE
+# PARAMETRY A GEOMETRIE
 # -----------------------------------------------------------------------------
 
 # Načtení mapy motoru
@@ -594,12 +658,12 @@ print(f"   (Teoretické maximum bez odběru)")
 # Výpis pro unašivý moment
 if ENABLE_DRAG_TORQUE and max_drag_heat_rec > 0:
     print(f"   -> Z toho VLEČNÝ MOMENT (Drag): {max_drag_heat_rec:.1f} W ({max_drag_heat_rec/1000:.2f} kW)")
-    print(f"      (Toto teplo se tvoří v pauze třením oleje!)")
+    print(f"      -")
 else:
-    print(f"   -> Vlečný moment:             0.0 W (Deaktivováno nebo zanedbatelné)")
+    print(f"   -> Vlečný moment:             0.0 W ")
 
 print(f"2. ODBĚR NÁSTAVBOU:              {P_auxiliary_load_kW:.1f} kW")
-print(f"3. VÝSLEDNÝ VÝKON DO SPOJKY:     {max_power_net_rec / 1000:.1f} kW")
+print(f"3. VÝSLEDNÝ VÝKON DO SPOJKY (neponížen o beta):     {max_power_net_rec / 1000:.1f} kW")
 print(f"   (Poníženo o nástavbu)")
 print("-" * 60)
 print(f"Špičkový tepelný tok (q):    {max_q_net_rec / 1e6:.2f} MW/m²")
